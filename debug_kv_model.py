@@ -1,5 +1,19 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
+DEBUG VERSION: GPT Language Model with KV-Cache Debug Instrumentation
+
+This is a debug version of model.py that includes extensive debug printing.
+Use this for troubleshooting KV cache issues.
+
+For production use, import from model.py instead (no debug overhead).
+
+DEBUG USAGE:
+    import os
+    os.environ["KV_DEBUG"] = "1"           # Enable debug output
+    os.environ["KV_DEBUG_LAYER"] = "0"     # Optional: only show specific layer
+
+    from debug_kv_model import GPT, GPTConfig
+    model = GPT(GPTConfig())
+    # ... debug output will print during generation
 
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
@@ -22,10 +36,25 @@ See KV_CACHE.md for detailed documentation.
 import math
 import inspect
 from dataclasses import dataclass
+import os
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# Debug controls (set KV_DEBUG=1 to enable; optional KV_DEBUG_LAYER to filter a layer index)
+KV_DEBUG = os.getenv("KV_DEBUG", "0") == "1"
+KV_DEBUG_LAYER = os.getenv("KV_DEBUG_LAYER")
+
+
+def _kvdbg_enabled_for_layer(layer_idx: int | None) -> bool:
+    if not KV_DEBUG:
+        return False
+    if KV_DEBUG_LAYER is None:
+        return True
+    if layer_idx is None:
+        return True
+    return str(layer_idx) == str(KV_DEBUG_LAYER)
 
 
 class LayerNorm(nn.Module):
@@ -113,6 +142,12 @@ class CausalSelfAttention(nn.Module):
             max_ctx = self.bias.size(-1)  # block_size
             new_cache_pos = cache_pos + T
 
+            if _kvdbg_enabled_for_layer(getattr(self, "layer_idx", None)):
+                print(
+                    f"[KVDBG][Attn L{getattr(self, 'layer_idx', '?')}] "
+                    f"cache_pos={cache_pos} T={T} new_cache_pos={new_cache_pos} max_ctx={max_ctx}"
+                )
+
             # (2.2) Write new K/V into cache at positions [cache_pos:cache_pos+T]
             k_cache[:, :, cache_pos:new_cache_pos, :] = k  # (B, nh, block_size, hs)
             v_cache[:, :, cache_pos:new_cache_pos, :] = v  # (B, nh, block_size, hs)
@@ -120,6 +155,12 @@ class CausalSelfAttention(nn.Module):
             # (2.3) Use all cached K/V (from position 0 to new_cache_pos)
             k = k_cache[:, :, :new_cache_pos, :]  # (B, nh, new_cache_pos, hs)
             v = v_cache[:, :, :new_cache_pos, :]  # (B, nh, new_cache_pos, hs)
+
+            if _kvdbg_enabled_for_layer(getattr(self, "layer_idx", None)):
+                print(
+                    f"[KVDBG][Attn L{getattr(self, 'layer_idx', '?')}] "
+                    f"using cache T_k={k.size(2)}"
+                )
         else:
             # (2.4) First pass: allocate and initialize cache
             max_ctx = self.bias.size(-1)  # block_size
@@ -144,6 +185,12 @@ class CausalSelfAttention(nn.Module):
             v_cache[:, :, :T, :] = v
             new_cache_pos = T
 
+            if _kvdbg_enabled_for_layer(getattr(self, "layer_idx", None)):
+                print(
+                    f"[KVDBG][Attn L{getattr(self, 'layer_idx', '?')}] "
+                    f"init_cache T={T} max_ctx={max_ctx}"
+                )
+
         # (2.5) Package updated cache for return
         new_cache = (k_cache, v_cache, new_cache_pos)
 
@@ -155,6 +202,11 @@ class CausalSelfAttention(nn.Module):
         # (4) Apply causal mask to prevent attending to future tokens
         T_q = q.size(2)  # Query length (usually 1 during cached generation)
         T_k = k.size(2)  # Key length (grows with cache: 1, 2, ..., block_size)
+
+        if _kvdbg_enabled_for_layer(getattr(self, "layer_idx", None)):
+            print(
+                f"[KVDBG][Attn L{getattr(self, 'layer_idx', '?')}] mask T_q={T_q} T_k={T_k}"
+            )
 
         if T_q == T_k:
             # (4.1) Standard case: same length (training or first generation step)
@@ -342,6 +394,27 @@ class GPT(nn.Module):
         else:
             # (1.2) Without cache: positions start at 0
             pos = torch.arange(0, t, dtype=torch.long, device=device)  # (T,)
+        if KV_DEBUG:
+            if kv_cache is None:
+                if t <= 16:
+                    print(
+                        f"[KVDBG][GPT] kv_cache=None b={b} t={t} pos={pos.detach().cpu().tolist()}"
+                    )
+                else:
+                    print(
+                        f"[KVDBG][GPT] kv_cache=None b={b} t={t} pos[0]={pos[0].item()} pos[-1]={pos[-1].item()}"
+                    )
+            else:
+                if t <= 16:
+                    print(
+                        f"[KVDBG][GPT] kv_cache=present b={b} t={t} cache_pos={cache_pos} "
+                        f"pos={pos.detach().cpu().tolist()}"
+                    )
+                else:
+                    print(
+                        f"[KVDBG][GPT] kv_cache=present b={b} t={t} cache_pos={cache_pos} "
+                        f"pos[0]={pos[0].item()} pos[-1]={pos[-1].item()}"
+                    )
 
         # (2) Get token and position embeddings
         tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
@@ -357,6 +430,12 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             # (3.1) Get cache for this specific layer
             layer_cache = kv_cache[i] if kv_cache is not None else None
+
+            if _kvdbg_enabled_for_layer(getattr(block, "layer_idx", None)):
+                print(
+                    f"[KVDBG][Block {getattr(block, 'layer_idx', '?')}] "
+                    f"x.shape={x.shape} kv_cache={'present' if layer_cache is not None else 'none'}"
+                )
 
             # (3.2) Forward through block, get updated cache
             x, new_layer_cache = block(x, kv_cache=layer_cache)  # (B, T, n_embd)
@@ -558,6 +637,13 @@ class GPT(nn.Module):
                 # (2.2.1) If cache was full, disable it
                 if cache_full:
                     kv_cache = None
+
+            if KV_DEBUG:
+                print(
+                    f"[KVDBG][generate] step={step} use_cache={use_cache} "
+                    f"kv_cache_present={kv_cache is not None} cache_full={cache_full} "
+                    f"idx_cond.shape={tuple(idx_cond.shape)}"
+                )
 
             # (3) Forward pass (with or without cache)
             logits, _, kv_cache = self(

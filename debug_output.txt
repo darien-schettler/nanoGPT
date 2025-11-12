@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/darienschettler/PycharmProjects/nanoGPT-1/test_kv_cache_debug.py", line 18, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'

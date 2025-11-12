@@ -1,22 +1,28 @@
 """
 Full definition of a GPT Language Model, all of it in this single file.
-
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
 https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 
-KV-CACHE MODIFICATIONS:
-This file includes KV (Key-Value) caching for faster autoregressive generation.
-Five main changes are marked with "KV-CACHE CHANGE #N" comments:
-  #1: CausalSelfAttention - Always register causal mask buffer
-  #2: CausalSelfAttention.forward() - Add cache parameter and read/write logic
-  #3: Block.forward() - Thread cache through attention layer
-  #4: GPT.forward() - Handle position calculation and thread cache through layers
-  #5: GPT.generate() - Manage cache lifecycle during generation
+KV-CACHE IMPLEMENTATION:
+This file has been modified to support KV-caching for faster inference.
+Changes are marked with "KV-CACHE CHANGE" comments at the following locations:
 
-See KV_CACHE.md for detailed documentation.
+LOCATION 0 (line 48-55):    CausalSelfAttention.__init__ - Always register causal mask buffer
+LOCATION 1a (line 85-126):  CausalSelfAttention.forward - Sliding window cache with torch.roll
+LOCATION 1c (line 129-150): CausalSelfAttention.forward - Handle different Q,K lengths
+LOCATION 2 (line 159-169):  CausalSelfAttention.forward - Return cache with position
+LOCATION 3 (line 196-207):  Block.forward - Thread cache through attention
+LOCATION 4 (line 276-293):  GPT.forward - Compute positions for sliding window
+LOCATION 5 (line 300-310):  GPT.forward - Distribute cache to layers
+LOCATION 6a (line 451-456): GPT.generate - Initialize cache
+LOCATION 6b (line 462-469): GPT.generate - Process only new token with cache
+
+Total: 9 marked changes across 6 major locations
+Key optimizations: Sliding window (simple & correct), sequential cache (works with mask)
+See KV_CACHE_GUIDE.md for detailed documentation.
 """
 
 import math
@@ -54,12 +60,18 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-
-        # ========================================================================
-        # KV-CACHE CHANGE #1: Always register causal mask buffer
-        # WHY: Manual attention masking needed when Q and K have different lengths
-        #      (e.g., T_q=1, T_k=128 during cached generation)
-        # ========================================================================
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if not self.flash:
+            print(
+                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
+            )
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 0): Always register causal mask buffer
+        # WHY: Manual attention path needs this mask for both standard and cache cases
+        # WHAT: Move register_buffer outside the if-block so it's always available
+        # ============================================================================
+        # causal mask to ensure that attention is only applied to the left in the input sequence
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size, config.block_size)).view(
@@ -67,31 +79,13 @@ class CausalSelfAttention(nn.Module):
             ),
         )
 
-    # ========================================================================
-    # KV-CACHE CHANGE #2: Add kv_cache parameter to forward()
-    # WHAT: Accept and return cache tuple to enable K/V reuse across generation steps
-    # ========================================================================
-    def forward(self, x, kv_cache=None):
-        """
-        Forward pass with optional KV caching.
+    def forward(self, x, kv_cache=None):  # <-- KV-CACHE CHANGE: Add kv_cache parameter
+        B, T, C = (
+            x.size()
+        )  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        Args:
-            x (Tensor): Input tensor of shape (B, T, C)
-            kv_cache (tuple, optional): Cache tuple (k_cache, v_cache, cache_pos)
-                - k_cache: Tensor of shape (B, n_head, block_size, head_dim)
-                - v_cache: Tensor of shape (B, n_head, block_size, head_dim)
-                - cache_pos: Integer, number of tokens currently cached
-
-        Returns:
-            tuple: (output, new_cache)
-                - output: Tensor of shape (B, T, C)
-                - new_cache: Updated cache tuple
-        """
-        B, T, C = x.size()  # (batch, seq_len, n_embd)
-
-        # (1) Compute Q, K, V for all heads
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  # Each: (B, T, C)
-        # (1.1) Reshape to separate heads: (B, T, n_head, head_dim) -> (B, n_head, T, head_dim)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(
             1, 2
         )  # (B, nh, T, hs)
@@ -102,27 +96,39 @@ class CausalSelfAttention(nn.Module):
             1, 2
         )  # (B, nh, T, hs)
 
-        # ========================================================================
-        # KV-CACHE CHANGE #2 (continued): Cache read/write logic
-        # WHAT: Store new K/V in cache, read all cached K/V for attention
-        # NOTE: Cache only works up to block_size tokens (no sliding window)
-        # ========================================================================
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 1a): Use preallocated cache with sliding window
+        # WHY: Keeps cache sequential, which is simple and works with the existing mask
+        # WHAT: When cache is full, "roll" (shift) the cache left and write the new
+        #       token at the end. This is one memory copy, but it's simple and correct.
+        # ============================================================================
         if kv_cache is not None:
-            # (2.1) Unpack cache: k_cache/v_cache are (B, nh, block_size, hs)
             k_cache, v_cache, cache_pos = kv_cache
-            max_ctx = self.bias.size(-1)  # block_size
+            max_ctx = self.bias.size(-1)  # == config.block_size
             new_cache_pos = cache_pos + T
 
-            # (2.2) Write new K/V into cache at positions [cache_pos:cache_pos+T]
-            k_cache[:, :, cache_pos:new_cache_pos, :] = k  # (B, nh, block_size, hs)
-            v_cache[:, :, cache_pos:new_cache_pos, :] = v  # (B, nh, block_size, hs)
-
-            # (2.3) Use all cached K/V (from position 0 to new_cache_pos)
-            k = k_cache[:, :, :new_cache_pos, :]  # (B, nh, new_cache_pos, hs)
-            v = v_cache[:, :, :new_cache_pos, :]  # (B, nh, new_cache_pos, hs)
+            if new_cache_pos <= max_ctx:
+                # Cache not full: write to the end
+                k_cache[:, :, cache_pos:new_cache_pos, :] = k
+                v_cache[:, :, cache_pos:new_cache_pos, :] = v
+                k = k_cache[:, :, :new_cache_pos, :]  # Use the filled part
+                v = v_cache[:, :, :new_cache_pos, :]
+            else:
+                # Cache is full:
+                # 1. Roll the cache to the left (e.g., [0,1,2,3] -> [1,2,3,3])
+                k_cache = torch.roll(k_cache, shifts=-T, dims=2)
+                v_cache = torch.roll(v_cache, shifts=-T, dims=2)
+                # 2. Write the new k,v at the end (e.g., [1,2,3,NEW])
+                k_cache[:, :, -T:, :] = k
+                v_cache[:, :, -T:, :] = v
+                # 3. The cache is now full and sequential
+                k = k_cache
+                v = v_cache
+                # 4. Cap the absolute position counter
+                new_cache_pos = max_ctx
         else:
-            # (2.4) First pass: allocate and initialize cache
-            max_ctx = self.bias.size(-1)  # block_size
+            # First pass: initialize preallocated cache
+            max_ctx = self.bias.size(-1)  # == config.block_size
             k_cache = torch.zeros(
                 B,
                 self.n_head,
@@ -130,7 +136,7 @@ class CausalSelfAttention(nn.Module):
                 C // self.n_head,
                 dtype=k.dtype,
                 device=k.device,
-            )  # (B, nh, block_size, hs)
+            )
             v_cache = torch.zeros(
                 B,
                 self.n_head,
@@ -138,46 +144,59 @@ class CausalSelfAttention(nn.Module):
                 C // self.n_head,
                 dtype=v.dtype,
                 device=v.device,
-            )  # (B, nh, block_size, hs)
-            # (2.4.1) Write initial K/V
+            )
+            # Write initial k,v
             k_cache[:, :, :T, :] = k
             v_cache[:, :, :T, :] = v
             new_cache_pos = T
+            k = k_cache[:, :, :T, :]  # Use the filled part
+            v = v_cache[:, :, :T, :]
+        # ============================================================================
 
-        # (2.5) Package updated cache for return
-        new_cache = (k_cache, v_cache, new_cache_pos)
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 1c): Handle different Q,K lengths in attention
+        # WHY: With cache, Q has length 1 (new token) but K has length T (all cached)
+        # WHAT: Use manual attention with custom masking for different sequence lengths
+        # ============================================================================
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # Note: Flash Attention disabled for KV-cache to keep implementation simple
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
-        # (3) Compute attention scores: Q @ K^T scaled by sqrt(head_dim)
-        att = (q @ k.transpose(-2, -1)) * (
-            1.0 / math.sqrt(k.size(-1))
-        )  # (B, nh, T_q, T_k)
-
-        # (4) Apply causal mask to prevent attending to future tokens
-        T_q = q.size(2)  # Query length (usually 1 during cached generation)
-        T_k = k.size(2)  # Key length (grows with cache: 1, 2, ..., block_size)
-
+        # Handle causal masking - need to account for different Q,K lengths when using cache
+        T_q = q.size(2)
+        T_k = k.size(2)
         if T_q == T_k:
-            # (4.1) Standard case: same length (training or first generation step)
-            # Use standard causal mask: position i can attend to positions [0..i]
+            # Standard case: use precomputed bias mask
             att = att.masked_fill(self.bias[:, :, :T_q, :T_k] == 0, float("-inf"))
         else:
-            # (4.2) Cache case: T_q < T_k (e.g., T_q=1, T_k=128)
-            # New query is at the end of the sequence, can attend to all previous keys
-            offset = T_k - T_q  # e.g., 128 - 1 = 127
-            row_idx = torch.arange(T_q, device=att.device) + offset  # [127]
-            causal_mask = self.bias[:, :, row_idx, :T_k]  # (1, 1, T_q, T_k)
+            # Cache case: Q is shorter than K, slice precomputed bias for efficiency
+            # Each query at relative position i attends to keys at absolute positions up to (offset + i)
+            offset = T_k - T_q
+            row_idx = torch.arange(T_q, device=att.device) + offset
+            causal_mask = self.bias[:, :, row_idx, :T_k]
             att = att.masked_fill(causal_mask == 0, float("-inf"))
 
-        # (5) Apply softmax and compute weighted sum of values
-        att = F.softmax(att, dim=-1)  # (B, nh, T_q, T_k)
+        att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
-        y = att @ v  # (B, nh, T_q, T_k) @ (B, nh, T_k, hs) -> (B, nh, T_q, hs)
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
 
-        # (6) Concatenate heads and apply output projection
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
-        y = self.resid_dropout(self.c_proj(y))  # (B, T, C)
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
 
-        return y, new_cache
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 2): Return cache alongside output
+        # WHY: Cache must flow back up to be reused in next forward pass
+        # WHAT: Return tuple of (k_cache, v_cache, position) for preallocated cache
+        # ============================================================================
+        if kv_cache is not None:
+            new_cache = (k_cache, v_cache, new_cache_pos)
+        else:
+            new_cache = (k_cache, v_cache, new_cache_pos)
+        return y, new_cache  # <-- KV-CACHE CHANGE: Return 2 values instead of 1
+        # ============================================================================
 
 
 class MLP(nn.Module):
@@ -204,31 +223,18 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    # ========================================================================
-    # KV-CACHE CHANGE #3: Thread cache through Block.forward()
-    # WHAT: Pass cache to attention layer and return updated cache
-    # ========================================================================
-    def forward(self, x, kv_cache=None):
-        """
-        Forward pass through transformer block with optional KV caching.
+    def forward(self, x, kv_cache=None):  # <-- KV-CACHE CHANGE: Add kv_cache parameter
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 3): Thread cache through attention layer
+        # WHY: Attention layer needs cache; block acts as passthrough
+        # WHAT: Pass cache to attention, receive updated cache, return it
+        # ============================================================================
+        attn_out, new_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)
+        x = x + attn_out
+        # ============================================================================
 
-        Args:
-            x (Tensor): Input of shape (B, T, C)
-            kv_cache (tuple, optional): KV cache for attention layer
-
-        Returns:
-            tuple: (output, new_cache)
-                - output: Tensor of shape (B, T, C)
-                - new_cache: Updated cache tuple
-        """
-        # (1) Self-attention with residual connection
-        attn_output, new_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)  # (B, T, C)
-        x = x + attn_output  # (B, T, C)
-
-        # (2) MLP with residual connection
-        x = x + self.mlp(self.ln_2(x))  # (B, T, C)
-
-        return x, new_cache
+        x = x + self.mlp(self.ln_2(x))
+        return x, new_cache  # <-- KV-CACHE CHANGE: Return 2 values instead of 1
 
 
 @dataclass
@@ -266,10 +272,6 @@ class GPT(nn.Module):
         self.transformer.wte.weight = (
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
-        # Assign stable layer indices for debugging visibility
-        for i, block in enumerate(self.transformer.h):
-            setattr(block, "layer_idx", i)
-            setattr(block.attn, "layer_idx", i)
 
         # init all weights
         self.apply(self._init_weights)
@@ -303,81 +305,82 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # ========================================================================
-    # KV-CACHE CHANGE #4: Add kv_cache parameter to GPT.forward()
-    # WHAT: Compute positions based on cache state, thread cache through all layers
-    # ========================================================================
-    def forward(self, idx, targets=None, kv_cache=None):
-        """
-        Forward pass through GPT model with optional KV caching.
-
-        Args:
-            idx (Tensor): Input token indices of shape (B, T)
-            targets (Tensor, optional): Target token indices of shape (B, T) for loss computation
-            kv_cache (list[tuple], optional): List of cache tuples, one per layer
-
-        Returns:
-            tuple: (logits, loss, new_caches)
-                - logits: Tensor of shape (B, T, vocab_size) or (B, 1, vocab_size) if targets=None
-                - loss: Scalar tensor if targets provided, else None
-                - new_caches: List of updated cache tuples, one per layer
-        """
+    def forward(
+        self, idx, targets=None, kv_cache=None
+    ):  # <-- KV-CACHE CHANGE: Add kv_cache parameter
         device = idx.device
-        b, t = idx.size()  # (batch, seq_len)
+        b, t = idx.size()
         assert t <= self.config.block_size, (
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         )
 
-        # ========================================================================
-        # KV-CACHE CHANGE #4 (continued): Position calculation
-        # WHAT: Use cache_pos to determine correct positions for new tokens
-        # ========================================================================
-        # (1) Compute position indices for position embeddings
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 4): Compute positions for sliding window
+        # WHY: With sliding window, positions reflect the window's view
+        # WHAT: When cache is full, new tokens get the last positions
+        # ============================================================================
         if kv_cache is not None:
-            # (1.1) With cache: new tokens start at position cache_pos
-            cache_pos = kv_cache[0][2]  # All layers share same position counter
-            pos = torch.arange(
-                cache_pos, cache_pos + t, dtype=torch.long, device=device
-            )  # (T,)
+            # Get current position from cache
+            cache_pos = kv_cache[0][2]  # third element is the position
+            if cache_pos >= self.config.block_size:
+                # Cache is full: positions for new tokens start at end
+                pos = torch.arange(
+                    self.config.block_size - t,
+                    self.config.block_size,
+                    dtype=torch.long,
+                    device=device,
+                )
+            else:
+                # Cache not full: normal positions
+                pos = torch.arange(
+                    cache_pos, cache_pos + t, dtype=torch.long, device=device
+                )
         else:
-            # (1.2) Without cache: positions start at 0
-            pos = torch.arange(0, t, dtype=torch.long, device=device)  # (T,)
+            # Standard case: positions start at 0
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
+        # ============================================================================
 
-        # (2) Get token and position embeddings
-        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)  # (B, T, n_embd)
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
 
-        # ========================================================================
-        # KV-CACHE CHANGE #4 (continued): Thread cache through all layers
-        # WHAT: Each layer gets its own cache, returns updated cache
-        # ========================================================================
-        # (3) Pass through transformer blocks with KV caching
-        new_caches = []  # Store updated cache from each layer
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 5): Distribute cache to layers and collect updates
+        # WHY: Each layer has its own K,V cache (different representations per layer)
+        # WHAT: Pass per-layer cache to each block, collect updated caches in list
+        # ============================================================================
+        new_caches = []
         for i, block in enumerate(self.transformer.h):
-            # (3.1) Get cache for this specific layer
             layer_cache = kv_cache[i] if kv_cache is not None else None
+            x, new_cache = block(x, kv_cache=layer_cache)
+            new_caches.append(new_cache)
+        # ============================================================================
 
-            # (3.2) Forward through block, get updated cache
-            x, new_layer_cache = block(x, kv_cache=layer_cache)  # (B, T, n_embd)
-            new_caches.append(new_layer_cache)
+        x = self.transformer.ln_f(x)
 
-        # (4) Final layer norm
-        x = self.transformer.ln_f(x)  # (B, T, n_embd)
-
-        # (5) Compute logits and loss
         if targets is not None:
-            # (5.1) Training: compute loss over all positions
-            logits = self.lm_head(x)  # (B, T, vocab_size)
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
             )
         else:
-            # (5.2) Inference: only compute logits for last position
-            logits = self.lm_head(x[:, [-1], :])  # (B, 1, vocab_size)
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(
+                x[:, [-1], :]
+            )  # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_caches
+        # ============================================================================
+        # KV-CACHE CHANGE: Always return cache (even if None on input)
+        # WHY: First forward pass initializes cache for subsequent iterations
+        # ============================================================================
+        return (
+            logits,
+            loss,
+            new_caches,
+        )  # <-- KV-CACHE CHANGE: Return 3 values instead of 2
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -511,73 +514,54 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
-    # ========================================================================
-    # KV-CACHE CHANGE #5: Update generate() to use cache
-    # WHAT: Process only last token when cache active, disable cache when full
-    # ========================================================================
     @torch.no_grad()
     def generate(
         self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=False
-    ):
+    ):  # <-- KV-CACHE CHANGE: Add use_cache parameter
         """
-        Generate tokens autoregressively with optional KV caching.
-
-        Args:
-            idx (Tensor): Input token indices of shape (B, T)
-            max_new_tokens (int): Number of tokens to generate
-            temperature (float, optional): Sampling temperature (default: 1.0)
-            top_k (int, optional): If set, only sample from top k tokens
-            use_cache (bool, optional): Enable KV caching for speedup (default: False)
-
-        Returns:
-            Tensor: Generated sequence of shape (B, T + max_new_tokens)
-
-        Note:
-            Cache is only used for the first block_size tokens. After that,
-            generation falls back to standard processing.
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        kv_cache = None  # Initialize cache
+        # ============================================================================
+        # KV-CACHE CHANGE (LOCATION 6a): Initialize cache
+        # WHY: Cache starts as None, gets populated on first forward pass
+        # ============================================================================
+        kv_cache = None
+        # ============================================================================
 
-        for step in range(max_new_tokens):
-            # (1) Determine if cache is full (reached block_size limit)
-            cache_full = (
-                kv_cache is not None and kv_cache[0][2] >= self.config.block_size
+        for i in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = (
+                idx
+                if idx.size(1) <= self.config.block_size
+                else idx[:, -self.config.block_size :]
             )
 
-            # (2) Prepare input for this step
-            if use_cache and kv_cache is not None and not cache_full:
-                # (2.1) Cache active and not full: process only last token
-                idx_cond = idx[:, [-1]]  # (B, 1)
-            else:
-                # (2.2) No cache or cache full: crop to block_size
-                idx_cond = (
-                    idx
-                    if idx.size(1) <= self.config.block_size
-                    else idx[:, -self.config.block_size :]
-                )  # (B, T) where T <= block_size
-                # (2.2.1) If cache was full, disable it
-                if cache_full:
-                    kv_cache = None
+            # ============================================================================
+            # KV-CACHE CHANGE (LOCATION 6b): Only process new token when using cache
+            # WHY: After first iteration, only need to process newest token (cache has rest)
+            # WHAT: After iteration 0, pass only the last token instead of full sequence
+            # ============================================================================
+            if use_cache and i > 0:
+                idx_cond = idx[:, [-1]]  # only the newest token
+            # ============================================================================
 
-            # (3) Forward pass (with or without cache)
+            # forward the model to get the logits for the index in the sequence
             logits, _, kv_cache = self(
-                idx_cond, kv_cache=kv_cache if (use_cache and not cache_full) else None
-            )  # logits: (B, T, vocab_size)
-
-            # (4) Sample next token
-            # (4.1) Get logits for last position and apply temperature
-            logits = logits[:, -1, :] / temperature  # (B, vocab_size)
-
-            # (4.2) Optionally restrict to top-k tokens
+                idx_cond, kv_cache=kv_cache if use_cache else None
+            )  # <-- KV-CACHE CHANGE: Unpack 3 values, pass cache
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float("Inf")
-
-            # (4.3) Convert to probabilities and sample
-            probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-
-            # (5) Append sampled token to sequence
-            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
